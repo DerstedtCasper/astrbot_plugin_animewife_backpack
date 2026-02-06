@@ -240,10 +240,10 @@ load_ntr_statuses()
 
 @register(
     "astrbot_plugin_animewife",
-    "SomniumDerstedt",
+    "DerstedtCasper",
     "群二次元老婆插件（自用改版）",
     "1.8.0",
-    "https://github.com/SomniumDerstedt/astrbot_plugin_animewife",
+    "https://github.com/DerstedtCasper/astrbot_plugin_animewife",
 )
 class WifePlugin(Star):
     """二次元老婆插件主类"""
