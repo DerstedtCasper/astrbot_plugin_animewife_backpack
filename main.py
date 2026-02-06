@@ -242,7 +242,7 @@ load_ntr_statuses()
     "astrbot_plugin_animewife",
     "DerstedtCasper",
     "群二次元老婆插件（自用改版）",
-    "1.8.0",
+    "1.8.1",
     "https://github.com/DerstedtCasper/astrbot_plugin_animewife",
 )
 class WifePlugin(Star):
@@ -319,16 +319,23 @@ class WifePlugin(Star):
             return target
         
         msg = normalize_cmd_text(event.message_str)
-        if msg.startswith("牛老婆") or msg.startswith("查老婆") or msg.startswith("发老婆"):
-            parts = msg.split(maxsplit=1)
-            if len(parts) > 1:
-                name = parts[1]
+        # 兼容“昵称 + 额外参数”的用法，例如：
+        # - /牛老婆 昵称 3
+        # - /查老婆 昵称
+        for cmd in ("牛老婆", "查老婆"):
+            if msg.startswith(cmd):
+                rest = msg[len(cmd):].strip()
+                if not rest:
+                    return None
+                first = rest.split()[0].strip()
+                # 如果第一个参数是数字，通常是编号参数，不当作昵称匹配
+                if first.isdigit():
+                    return None
                 group_id = str(event.message_obj.group_id)
                 cfg = load_group_config(group_id)
                 for uid, data in cfg.items():
-                    if isinstance(data, list) and len(data) > 2:
-                        if data[2] == name:
-                            return uid
+                    if isinstance(data, list) and len(data) > 2 and data[2] == first:
+                        return uid
         return None
 
     # ==================== 消息处理 ====================
@@ -488,7 +495,8 @@ class WifePlugin(Star):
 • 替换老婆 <编号> - 用“今天的老婆”替换背包指定位置
 
 【牛老婆功能】(概率较低😭)
-• 牛老婆 [@用户] - 有概率抢走别人的老婆(额外入库到背包，不顶掉今日老婆位)
+• 牛老婆 [@用户] - 有概率抢走别人的今日老婆(额外入库到背包，不顶掉今日老婆位)
+• 牛老婆 @用户 <编号> - 有概率抢走对方背包指定编号的老婆(额外入库到背包，不顶掉今日老婆位)
 • 重置牛 [@用户] - 重置牛的次数(失败会禁言)
 
 【换老婆功能】
@@ -818,20 +826,58 @@ class WifePlugin(Star):
         today = get_today()
         size = self.backpack_size
 
+        # 解析可选背包编号：
+        # - /牛老婆 @用户 <编号> : 牛走对方背包指定槽位
+        # - /牛老婆 @用户       : 保持旧行为（牛走对方今日老婆）
+        msg = normalize_cmd_text(event.message_str)
+        rest = msg[len("牛老婆"):].strip() if msg.startswith("牛老婆") else ""
+        slot: int | None = None
+        if rest:
+            parts = rest.split()
+            if parts and parts[-1].isdigit():
+                try:
+                    slot_arg = int(parts[-1])
+                except Exception:
+                    slot_arg = None
+                if slot_arg is not None:
+                    if 1 <= slot_arg <= size:
+                        slot = slot_arg
+                    else:
+                        yield event.plain_result(
+                            f"{nick}，编号范围是 1-{size}。用法：/牛老婆 @用户 <编号>（不带编号则默认牛今天的老婆）"
+                        )
+                        return
+
         # 获取目标用户
         tid = self.parse_target(event)
         if not tid or tid == uid:
-            msg = "请@你想牛的对象，或输入完整的昵称哦~" if not tid else "不能牛自己呀，换个人试试吧~"
-            yield event.plain_result(f"{nick}，{msg}")
+            if not tid:
+                tip = "请@你想牛的对象，或输入完整的昵称哦~"
+                if slot is not None or (rest.strip().isdigit() if rest else False):
+                    tip = f"请@你想牛的对象。用法：/牛老婆 @用户 <1-{size}>（不带编号默认牛今天的老婆）"
+                yield event.plain_result(f"{nick}，{tip}")
+            else:
+                yield event.plain_result(f"{nick}，不能牛自己呀，换个人试试吧~")
             return
 
         # 目标存在性检查（不消耗次数）
         async with get_config_lock(gid):
             cfg = load_group_config(gid)
-            target_data = cfg.get(tid)
-            if not target_data or not isinstance(target_data, list) or target_data[1] != today:
-                yield event.plain_result("对方今天还没有老婆可牛哦~")
-                return
+            if slot is None:
+                target_data = cfg.get(tid)
+                if not target_data or not isinstance(target_data, list) or target_data[1] != today:
+                    yield event.plain_result("对方今天还没有老婆可牛哦~")
+                    return
+            else:
+                backpacks = cfg.get(BACKPACKS_KEY, {})
+                if not isinstance(backpacks, dict):
+                    backpacks = {}
+                items = normalize_backpack(backpacks.get(tid), size)
+                entry = items[slot - 1] if 0 <= slot - 1 < len(items) else None
+                img, _ = backpack_entry_to_img_note(entry)
+                if not img:
+                    yield event.plain_result(f"对方背包的{slot}号位还是空的哦~")
+                    return
 
         # 消耗一次牛老婆次数
         async with records_lock:
@@ -860,29 +906,52 @@ class WifePlugin(Star):
 
         async with get_config_lock(gid):
             cfg = load_group_config(gid)
-            target_data = cfg.get(tid)
-            if not target_data or not isinstance(target_data, list) or target_data[1] != today:
-                stolen_img = None
+            if slot is None:
+                target_data = cfg.get(tid)
+                if not target_data or not isinstance(target_data, list) or target_data[1] != today:
+                    stolen_img = None
+                else:
+                    stolen_img = target_data[0]
+                    stolen_from = target_data[2] if len(target_data) > 2 else str(tid)
+
+                    # 目标用户失去今日老婆（保持“牛”语义）
+                    del cfg[tid]
+                    cancel_ids.append(tid)
             else:
-                stolen_img = target_data[0]
-                stolen_from = target_data[2] if len(target_data) > 2 else str(tid)
+                backpacks = cfg.get(BACKPACKS_KEY, {})
+                if not isinstance(backpacks, dict):
+                    backpacks = {}
+                titems = normalize_backpack(backpacks.get(tid), size)
+                entry = titems[slot - 1] if 0 <= slot - 1 < len(titems) else None
+                img, _ = backpack_entry_to_img_note(entry)
+                if not img:
+                    stolen_img = None
+                else:
+                    stolen_img = img
+                    tdata = cfg.get(tid)
+                    if isinstance(tdata, list) and len(tdata) > 2 and tdata[2]:
+                        stolen_from = tdata[2]
+                    else:
+                        stolen_from = str(tid)
 
-                # 目标用户失去今日老婆（保持“牛”语义）
-                del cfg[tid]
-                cancel_ids.append(tid)
+                    # 目标用户失去背包指定槽位老婆
+                    titems[slot - 1] = None
+                    backpacks[tid] = titems
+                    cfg[BACKPACKS_KEY] = backpacks
 
-                # 额外入库到背包，并带备注
+            if stolen_img:
+                # 额外入库到背包，并带备注（不顶掉自己的今日老婆位）
                 backpacks = cfg.get(BACKPACKS_KEY, {})
                 if not isinstance(backpacks, dict):
                     backpacks = {}
                 items = normalize_backpack(backpacks.get(uid), size)
-                slot = first_empty_slot(items)
+                empty_slot = first_empty_slot(items)
                 note = f"牛自用户 {stolen_from}" if stolen_from else "牛自用户"
-                if slot is not None:
-                    items[slot - 1] = make_backpack_entry(stolen_img, note)
+                if empty_slot is not None:
+                    items[empty_slot - 1] = make_backpack_entry(stolen_img, note)
                     backpacks[uid] = items
                     cfg[BACKPACKS_KEY] = backpacks
-                    stored_slot = slot
+                    stored_slot = empty_slot
                 else:
                     is_full = True
 
@@ -904,11 +973,12 @@ class WifePlugin(Star):
 
         name = format_wife_name(stolen_img)
         note_suffix = f"（牛自用户 {stolen_from}）" if stolen_from else ""
+        src_suffix = f"（来自对方背包{slot}号位）" if slot is not None else ""
         keep_suffix = "不会顶掉你今天抽到的老婆位。"
         if stored_slot is not None:
-            text = f"{nick}，牛老婆成功！你牛到了 {name}{note_suffix}，已存入背包{stored_slot}号位~{keep_suffix}"
+            text = f"{nick}，牛老婆成功！你牛到了 {name}{note_suffix}{src_suffix}，已存入背包{stored_slot}号位~{keep_suffix}"
         else:
-            text = f"{nick}，牛老婆成功！你牛到了 {name}{note_suffix}，但你的背包已满，本次未保存~{keep_suffix}"
+            text = f"{nick}，牛老婆成功！你牛到了 {name}{note_suffix}{src_suffix}，但你的背包已满，本次未保存~{keep_suffix}"
 
         path = os.path.join(IMG_DIR, stolen_img)
         try:
