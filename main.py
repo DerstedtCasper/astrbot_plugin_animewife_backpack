@@ -23,6 +23,8 @@ RECORDS_FILE = os.path.join(CONFIG_DIR, "records.json")
 SWAP_REQUESTS_FILE = os.path.join(CONFIG_DIR, "swap_requests.json")
 NTR_STATUS_FILE = os.path.join(CONFIG_DIR, "ntr_status.json")
 BACKPACKS_KEY = "__wife_backpacks__"
+# 记录“今日老婆”在背包中的绑定槽位（用于换老婆/发老婆时同步更新同一槽位）
+BACKPACK_TODAY_SLOT_KEY = "__wife_backpack_today_slot__"
 
 # 仅允许这些后缀用于从本地文件系统读取，避免路径穿越/任意文件读取
 ALLOWED_IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -218,6 +220,61 @@ def normalize_backpack(raw: object, size: int) -> list:
     elif len(items) > size:
         items = items[:size]
     return items
+
+
+def get_today_slot_marks(cfg: dict) -> dict:
+    """获取背包今日槽位绑定表：{uid: {date, slot}}。"""
+    marks = cfg.get(BACKPACK_TODAY_SLOT_KEY, {})
+    return marks if isinstance(marks, dict) else {}
+
+
+def _read_today_slot_mark(marks: dict, uid: str, today: str, size: int) -> int | None:
+    rec = marks.get(uid)
+    if not isinstance(rec, dict):
+        return None
+    if rec.get("date") != today:
+        return None
+    slot = rec.get("slot")
+    if not isinstance(slot, int):
+        return None
+    if 1 <= slot <= size:
+        return slot
+    return None
+
+
+def _infer_today_slot_from_items(items: list, img: str) -> int | None:
+    """尝试从背包里推断“今日老婆槽位”（兼容旧数据：抽老婆已入库但未记录绑定）。"""
+    if not img or not isinstance(img, str):
+        return None
+    for i, entry in enumerate(items, start=1):
+        e_img, _ = backpack_entry_to_img_note(entry)
+        if e_img == img:
+            return i
+    return None
+
+
+def bind_today_slot(cfg: dict, uid: str, today: str, slot: int) -> None:
+    """写入“今日老婆”绑定槽位。"""
+    marks = get_today_slot_marks(cfg)
+    marks[uid] = {"date": today, "slot": int(slot)}
+    cfg[BACKPACK_TODAY_SLOT_KEY] = marks
+
+
+def get_or_infer_today_slot(cfg: dict, uid: str, today: str, size: int, *, items: list | None = None, prefer_img: str | None = None) -> int | None:
+    """获取或推断今日绑定槽位；推断成功会写回 cfg。"""
+    marks = get_today_slot_marks(cfg)
+    slot = _read_today_slot_mark(marks, uid, today, size)
+    if slot is not None:
+        # 确保 key 已存在且为 dict（避免 marks 来源非法导致后续写入丢失）
+        cfg[BACKPACK_TODAY_SLOT_KEY] = marks
+        return slot
+    if items is not None and prefer_img:
+        inferred = _infer_today_slot_from_items(items, prefer_img)
+        if inferred is not None:
+            bind_today_slot(cfg, uid, today, inferred)
+            return inferred
+    cfg[BACKPACK_TODAY_SLOT_KEY] = marks
+    return None
 
 
 def first_empty_slot(items: list) -> int | None:
@@ -512,6 +569,7 @@ class WifePlugin(Star):
                         auto_slot = slot
                         backpacks[uid] = items
                         cfg[BACKPACKS_KEY] = backpacks
+                        bind_today_slot(cfg, uid, today, slot)
                     else:
                         backpack_full = True
                         backpack_items = items
@@ -770,6 +828,8 @@ class WifePlugin(Star):
                 items[slot - 1] = img
                 backpacks[uid] = items
                 cfg[BACKPACKS_KEY] = backpacks
+                # 绑定“今日老婆”到此槽位，后续换老婆/发老婆会同步更新该槽位
+                bind_today_slot(cfg, uid, today, slot)
                 save_group_config(gid, cfg)
 
         if err:
@@ -875,22 +935,44 @@ class WifePlugin(Star):
                 else:
                     target_name = str(tid)
 
+            # 记录旧的“今日老婆”，用于推断绑定槽位（兼容旧数据）
+            prev_img, _ = extract_today_wife(cfg.get(tid), today)
+
             # 覆盖今日老婆
             cfg[tid] = [img, today, target_name]
 
-            # 优先入库：有空位就自动写入；满了则仅覆盖今日老婆位
+            # 优先入库：
+            # 1) 若已绑定“今日老婆槽位”，则同步覆盖该槽位（抽/换机制绑定）
+            # 2) 否则若有空位则写入并绑定
+            # 3) 背包满则仅覆盖今日老婆位
             backpacks = cfg.get(BACKPACKS_KEY, {})
             if not isinstance(backpacks, dict):
                 backpacks = {}
             items = normalize_backpack(backpacks.get(tid), size)
-            slot = first_empty_slot(items)
-            if slot is not None:
-                items[slot - 1] = img
+            bound_slot = get_or_infer_today_slot(
+                cfg,
+                tid,
+                today,
+                size,
+                items=items,
+                prefer_img=prev_img,
+            )
+            if bound_slot is not None:
+                items[bound_slot - 1] = img
                 backpacks[tid] = items
                 cfg[BACKPACKS_KEY] = backpacks
-                stored_slot = slot
+                bind_today_slot(cfg, tid, today, bound_slot)
+                stored_slot = bound_slot
             else:
-                is_full = True
+                slot = first_empty_slot(items)
+                if slot is not None:
+                    items[slot - 1] = img
+                    backpacks[tid] = items
+                    cfg[BACKPACKS_KEY] = backpacks
+                    bind_today_slot(cfg, tid, today, slot)
+                    stored_slot = slot
+                else:
+                    is_full = True
 
             save_group_config(gid, cfg)
 
@@ -1143,44 +1225,114 @@ class WifePlugin(Star):
         uid = str(event.get_sender_id())
         nick = event.get_sender_name()
         today = get_today()
-        
+        size = self.backpack_size
+
+        # 先原子占用一次“换老婆次数”，避免并发下超额；若后续失败再回滚
+        reserved = False
         async with records_lock:
-            # 检查每日换老婆次数
             recs = records["change"].setdefault(gid, {})
             rec = recs.get(uid, {"date": "", "count": 0})
-            
-            if rec["date"] == today and rec["count"] >= self.change_max_per_day:
+            if rec.get("date") != today:
+                rec = {"date": today, "count": 0}
+            if int(rec.get("count", 0)) >= self.change_max_per_day:
                 yield event.plain_result(f"{nick}，你今天已经换了{self.change_max_per_day}次老婆啦，明天再来吧~")
                 return
-        
-        # 检查是否有老婆并删除
-        async with get_config_lock(gid):
-            cfg = load_group_config(gid)
-            if not extract_today_wife(cfg.get(uid), today)[0]:
-                yield event.plain_result(f"{nick}，你今天还没有老婆，先去抽一个再来换吧~")
-                return
-            
-            # 删除老婆
-            del cfg[uid]
-            save_group_config(gid, cfg)
-        
-        # 更新记录
-        async with records_lock:
-            if rec["date"] != today:
-                rec = {"date": today, "count": 1}
-            else:
-                rec["count"] += 1
+            rec["count"] = int(rec.get("count", 0)) + 1
             recs[uid] = rec
             save_records()
-        
-        # 取消相关交换请求
+            reserved = True
+
+        # 检查是否有今日老婆（不再删除记录，直接覆盖并同步背包绑定槽位）
+        async with get_config_lock(gid):
+            cfg = load_group_config(gid)
+            cur_img, _ = extract_today_wife(cfg.get(uid), today)
+            if not cur_img:
+                # 回滚占用次数
+                async with records_lock:
+                    recs = records["change"].setdefault(gid, {})
+                    rec2 = recs.get(uid, {"date": today, "count": 0})
+                    if rec2.get("date") == today and int(rec2.get("count", 0)) > 0:
+                        rec2["count"] = max(0, int(rec2.get("count", 0)) - 1)
+                        recs[uid] = rec2
+                        save_records()
+                yield event.plain_result(f"{nick}，你今天还没有老婆，先去抽一个再来换吧~")
+                return
+
+        new_img = await self._fetch_wife_image()
+        if not new_img:
+            # 回滚占用次数
+            async with records_lock:
+                recs = records["change"].setdefault(gid, {})
+                rec2 = recs.get(uid, {"date": today, "count": 0})
+                if rec2.get("date") == today and int(rec2.get("count", 0)) > 0:
+                    rec2["count"] = max(0, int(rec2.get("count", 0)) - 1)
+                    recs[uid] = rec2
+                    save_records()
+            yield event.plain_result("抱歉，今天的老婆获取失败了，请稍后再试~")
+            return
+
+        extra_lines: list[str] = []
+        wife_chain: list | None = None
+        async with get_config_lock(gid):
+            cfg = load_group_config(gid)
+            # 并发二次检查：确保仍有“今日老婆”记录（避免被其他操作清空/跨日）
+            prev_img, _ = extract_today_wife(cfg.get(uid), today)
+            if not prev_img:
+                # 回滚占用次数
+                async with records_lock:
+                    recs = records["change"].setdefault(gid, {})
+                    rec2 = recs.get(uid, {"date": today, "count": 0})
+                    if rec2.get("date") == today and int(rec2.get("count", 0)) > 0:
+                        rec2["count"] = max(0, int(rec2.get("count", 0)) - 1)
+                        recs[uid] = rec2
+                        save_records()
+                yield event.plain_result(f"{nick}，换老婆失败：你当前没有“今日老婆”记录了，请重新 /抽老婆~")
+                return
+
+            # 覆盖今日老婆
+            cfg[uid] = [new_img, today, nick]
+
+            # 同步背包：只更新“今日绑定槽位”，不新增槽位（抽/换机制绑定）
+            backpacks = cfg.get(BACKPACKS_KEY, {})
+            if not isinstance(backpacks, dict):
+                backpacks = {}
+            items = normalize_backpack(backpacks.get(uid), size)
+
+            bound_slot = get_or_infer_today_slot(
+                cfg,
+                uid,
+                today,
+                size,
+                items=items,
+                prefer_img=prev_img,
+            )
+            if bound_slot is not None:
+                items[bound_slot - 1] = new_img
+                backpacks[uid] = items
+                cfg[BACKPACKS_KEY] = backpacks
+                bind_today_slot(cfg, uid, today, bound_slot)
+                extra_lines.append(f"已同步更新老婆背包：{bound_slot}号位（容量 {size}）")
+            else:
+                # 未绑定：不自动入库，只提醒用户手动保存（避免换老婆刷满背包）
+                if first_empty_slot(items) is None:
+                    extra_lines.append(f"你的老婆背包已满（{size}/{size}），今天换到的老婆不会自动保存。")
+                extra_lines.append(f"如需保存，请发送 /替换老婆 <1-{size}> 选择一个位置替换；否则明天刷新后将消失。")
+
+            save_group_config(gid, cfg)
+
+            wife_chain = self._build_wife_message(new_img, nick, extra_lines=extra_lines or None)
+
+        # 取消相关交换请求（确认成功换老婆后再取消，避免“未换成功却取消了请求”）
         cancel_msg = await self.cancel_swap_on_wife_change(gid, [uid])
         if cancel_msg:
             yield event.plain_result(cancel_msg)
-        
+
+        if wife_chain is None:
+            yield event.plain_result(f"{nick}，换老婆失败：消息构建失败，请稍后再试~")
+            return
+
         # 立即展示新老婆
-        async for res in self.animewife(event, record_to_backpack=False):
-            yield res
+        yield event.chain_result(wife_chain)
 
     # ==================== 重置相关 ====================
 
