@@ -721,7 +721,7 @@ load_ntr_statuses()
     "astrbot_plugin_animewife",
     "DerstedtCasper",
     "群二次元老婆插件（自用改版）",
-    "1.9.1",
+    "1.9.2",
     "https://github.com/DerstedtCasper/astrbot_plugin_animewife_backpack",
 )
 class WifePlugin(Star):
