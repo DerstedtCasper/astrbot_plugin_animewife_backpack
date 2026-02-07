@@ -6,6 +6,7 @@ import os
 import json
 import aiohttp
 import asyncio
+import tempfile
 
 # ==================== 常量定义 ====================
 
@@ -22,6 +23,12 @@ RECORDS_FILE = os.path.join(CONFIG_DIR, "records.json")
 SWAP_REQUESTS_FILE = os.path.join(CONFIG_DIR, "swap_requests.json")
 NTR_STATUS_FILE = os.path.join(CONFIG_DIR, "ntr_status.json")
 BACKPACKS_KEY = "__wife_backpacks__"
+
+# 仅允许这些后缀用于从本地文件系统读取，避免路径穿越/任意文件读取
+ALLOWED_IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+# 网络请求超时（避免外部 HTTP 卡住协程）
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 # ==================== 全局数据存储 ====================
 
@@ -62,13 +69,103 @@ def load_json(path: str) -> dict:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except json.JSONDecodeError:
+        # 兼容带 BOM 的旧文件
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    except Exception:
         return {}
 
 
 def save_json(path: str, data: dict) -> None:
-    """保存数据到 JSON 文件"""
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+    """保存数据到 JSON 文件（原子写入，避免半写入导致配置损坏）。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = None
+    try:
+        # 使用同目录临时文件，确保 os.replace 原子替换
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=os.path.dirname(path),
+            delete=False,
+        ) as f:
+            tmp_path = f.name
+            json.dump(data, f, ensure_ascii=False, indent=4)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                # 某些环境下 fsync 可能不可用，忽略但仍保持原子替换
+                pass
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def normalize_img_id(img: str) -> str | None:
+    """规范化图片标识，拒绝绝对路径/路径穿越/非图片后缀。"""
+    if not isinstance(img, str):
+        return None
+    s = img.strip()
+    if not s:
+        return None
+    # 防止把 URL 当作文件名
+    if "://" in s:
+        return None
+    s = s.replace("\\", "/").lstrip("/").lstrip("\\")
+    norm = os.path.normpath(s)
+    # 统一使用 URL 风格的分隔符，避免 Windows 下反斜杠进入 URL
+    norm = norm.replace("\\", "/")
+    # 拒绝 Windows 盘符/驱动器相对路径等形式
+    if ":" in norm:
+        return None
+    if os.path.isabs(norm):
+        return None
+    if norm == ".." or norm.startswith("../") or norm.startswith(".."):
+        return None
+    ext = os.path.splitext(norm)[1].lower()
+    if ext not in ALLOWED_IMG_EXTS:
+        return None
+    return norm
+
+
+def safe_img_path(img: str) -> str | None:
+    """安全拼接本地图片路径：确保最终路径仍在 IMG_DIR 内。"""
+    rel = normalize_img_id(img)
+    if not rel:
+        return None
+    base = os.path.abspath(IMG_DIR)
+    cand = os.path.abspath(os.path.join(IMG_DIR, rel))
+    try:
+        if os.path.commonpath([base, cand]) != base:
+            return None
+    except Exception:
+        return None
+    return cand
+
+
+def extract_today_wife(wife_data: object, today: str) -> tuple[str | None, str | None]:
+    """从 cfg[uid] 中提取今日老婆 (img, owner_name)。返回 (None, None) 表示无效/过期。"""
+    if not isinstance(wife_data, list) or len(wife_data) < 2:
+        return None, None
+    if wife_data[1] != today:
+        return None, None
+    img = wife_data[0] if isinstance(wife_data[0], str) and wife_data[0] else None
+    owner = wife_data[2] if len(wife_data) > 2 and isinstance(wife_data[2], str) and wife_data[2] else None
+    return img, owner
+
+
+def get_cfg_nick(cfg: dict, uid: str, default: str | None = None) -> str:
+    data = cfg.get(uid)
+    if isinstance(data, list) and len(data) > 2 and isinstance(data[2], str) and data[2]:
+        return data[2]
+    return default or str(uid)
 
 
 def load_group_config(group_id: str) -> dict:
@@ -215,12 +312,18 @@ def load_swap_requests():
     today = get_today()
     cleaned = {}
     
+    if not isinstance(raw, dict):
+        raw = {}
+
     for gid, reqs in raw.items():
-        valid = {uid: rec for uid, rec in reqs.items() if rec.get("date") == today}
+        if not isinstance(reqs, dict):
+            continue
+        valid = {uid: rec for uid, rec in reqs.items() if isinstance(rec, dict) and rec.get("date") == today}
         if valid:
             cleaned[gid] = valid
     
-    globals()["swap_requests"] = cleaned
+    swap_requests.clear()
+    swap_requests.update(cleaned)
     if raw != cleaned:
         save_json(SWAP_REQUESTS_FILE, cleaned)
 
@@ -242,7 +345,7 @@ load_ntr_statuses()
     "astrbot_plugin_animewife",
     "DerstedtCasper",
     "群二次元老婆插件（自用改版）",
-    "1.8.1",
+    "1.8.2",
     "https://github.com/DerstedtCasper/astrbot_plugin_animewife",
 )
 class WifePlugin(Star):
@@ -371,18 +474,29 @@ class WifePlugin(Star):
         auto_slot: int | None = None
         backpack_full = False
         backpack_items: list | None = None
+
+        img: str | None = None
+
+        # 先在锁内检查是否已有今日老婆，避免无谓的外部请求
+        async with get_config_lock(gid):
+            cfg = load_group_config(gid)
+            img, _ = extract_today_wife(cfg.get(uid), today)
+
+        fetched_img: str | None = None
+        if not img:
+            fetched_img = await self._fetch_wife_image()
+            if not fetched_img:
+                yield event.plain_result("抱歉，今天的老婆获取失败了，请稍后再试~")
+                return
         
         async with get_config_lock(gid):
             cfg = load_group_config(gid)
-            wife_data = cfg.get(uid)
-            
-            if not wife_data or not isinstance(wife_data, list) or wife_data[1] != today:
-                # 今天还没抽，获取新老婆
-                img = await self._fetch_wife_image()
-                if not img:
-                    yield event.plain_result("抱歉，今天的老婆获取失败了，请稍后再试~")
-                    return
-
+            # 二次检查：并发下可能已被其他协程写入
+            img2, _ = extract_today_wife(cfg.get(uid), today)
+            if img2:
+                img = img2
+            else:
+                img = fetched_img
                 cfg[uid] = [img, today, nick]
 
                 # 老婆背包：仅在“抽老婆”场景自动记录（避免换老婆/内部调用刷满背包）
@@ -404,8 +518,6 @@ class WifePlugin(Star):
 
                 new_draw = True
                 save_group_config(gid, cfg)
-            else:
-                img = wife_data[0]
         
         extra_lines: list[str] = []
         if new_draw and record_to_backpack:
@@ -432,9 +544,11 @@ class WifePlugin(Star):
         """获取老婆图片文件名列表（本地优先，其次网络）。"""
         try:
             local_imgs = [
-                x
+                normalize_img_id(x)
                 for x in os.listdir(IMG_DIR)
-                if x and os.path.isfile(os.path.join(IMG_DIR, x))
+                if x
+                and os.path.isfile(os.path.join(IMG_DIR, x))
+                and normalize_img_id(x)
             ]
             if local_imgs:
                 return local_imgs
@@ -446,38 +560,39 @@ class WifePlugin(Star):
             return []
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
                 async with session.get(url) as resp:
                     if resp.status != 200:
                         return []
                     text = await resp.text()
-                    return [line.strip() for line in text.splitlines() if line.strip()]
+                    out: list[str] = []
+                    for line in text.splitlines():
+                        s = line.strip()
+                        if not s:
+                            continue
+                        rel = normalize_img_id(s)
+                        if rel:
+                            out.append(rel)
+                    return out
         except Exception:
             return []
 
     def _build_wife_message(self, img: str, nick: str, *, extra_lines: list[str] | None = None):
         """构建老婆消息链"""
-        name = os.path.splitext(img)[0].split("/")[-1]
-        
-        if "!" in name:
-            source, chara = name.split("!", 1)
-            text = f"{nick}，你今天的老婆是来自《{source}》的{chara}，请好好珍惜哦~"
-        else:
-            text = f"{nick}，你今天的老婆是{name}，请好好珍惜哦~"
+        text = f"{nick}，你今天的老婆是{format_wife_name(img)}，请好好珍惜哦~"
 
         if extra_lines:
             text += "\n" + "\n".join(extra_lines)
-        
-        path = os.path.join(IMG_DIR, img)
+
+        base_url = (self.image_base_url or "").strip()
+        url_img = normalize_img_id(img)
+        local_path = safe_img_path(img)
         try:
-            chain = [
-                Plain(text),
-                (
-                    Image.fromFileSystem(path)
-                    if os.path.exists(path)
-                    else Image.fromURL(self.image_base_url + img)
-                ),
-            ]
+            chain: list = [Plain(text)]
+            if local_path and os.path.exists(local_path):
+                chain.append(Image.fromFileSystem(local_path))
+            elif base_url and url_img:
+                chain.append(Image.fromURL(base_url + url_img))
             return chain
         except Exception:
             return [Plain(text)]
@@ -542,31 +657,28 @@ class WifePlugin(Star):
         async with get_config_lock(gid):
             cfg = load_group_config(gid)
             wife_data = cfg.get(tid)
-            
-            if not wife_data or not isinstance(wife_data, list) or wife_data[1] != today:
+
+            img, owner = extract_today_wife(wife_data, today)
+            if not img:
                 yield event.plain_result("没有发现老婆的踪迹，快去抽一个试试吧~")
                 return
-            
-            img, _, owner = wife_data
+            owner = owner or "对方"
         
-        name = os.path.splitext(img)[0].split("/")[-1]
-        
-        if "!" in name:
-            source, chara = name.split("!", 1)
-            text = f"{owner}的老婆是来自《{source}》的{chara}，羡慕吗？"
-        else:
-            text = f"{owner}的老婆是{name}，羡慕吗？"
-        
-        path = os.path.join(IMG_DIR, img)
+        text = f"{owner}的老婆是{format_wife_name(img)}，羡慕吗？"
+
+        base_url = (self.image_base_url or "").strip()
+        url_img = normalize_img_id(img)
+        local_path = safe_img_path(img)
         try:
             chain = [
                 Plain(text),
                 (
-                    Image.fromFileSystem(path)
-                    if os.path.exists(path)
-                    else Image.fromURL(self.image_base_url + img)
+                    Image.fromFileSystem(local_path)
+                    if local_path and os.path.exists(local_path)
+                    else (Image.fromURL(base_url + url_img) if base_url and url_img else None)
                 ),
             ]
+            chain = [x for x in chain if x is not None]
             yield event.chain_result(chain)
         except Exception:
             yield event.plain_result(text)
@@ -598,16 +710,19 @@ class WifePlugin(Star):
 
         extra = f"（{note}）" if note else ""
         text = f"{nick}，你的{slot}号老婆是({format_wife_name(img)}{extra})，想起她了么~"
-        path = os.path.join(IMG_DIR, img)
+        base_url = (self.image_base_url or "").strip()
+        url_img = normalize_img_id(img)
+        local_path = safe_img_path(img)
         try:
             chain = [
                 Plain(text),
                 (
-                    Image.fromFileSystem(path)
-                    if os.path.exists(path)
-                    else Image.fromURL(self.image_base_url + img)
+                    Image.fromFileSystem(local_path)
+                    if local_path and os.path.exists(local_path)
+                    else (Image.fromURL(base_url + url_img) if base_url and url_img else None)
                 ),
             ]
+            chain = [x for x in chain if x is not None]
             yield event.chain_result(chain)
         except Exception:
             yield event.plain_result(text)
@@ -642,10 +757,9 @@ class WifePlugin(Star):
         async with get_config_lock(gid):
             cfg = load_group_config(gid)
             wife_data = cfg.get(uid)
-            if not wife_data or not isinstance(wife_data, list) or wife_data[1] != today:
+            img, _ = extract_today_wife(wife_data, today)
+            if not img:
                 err = f"{nick}，你今天还没有老婆，先 /抽老婆 再来替换吧~"
-            else:
-                img = wife_data[0]
 
             if img:
                 backpacks = cfg.get(BACKPACKS_KEY, {})
@@ -793,16 +907,19 @@ class WifePlugin(Star):
             )
         )
         text = f"{sender_nick} 给 {target_name} 发了一位老婆：{name}。{extra}"
-        path = os.path.join(IMG_DIR, img)
+        base_url = (self.image_base_url or "").strip()
+        url_img = normalize_img_id(img)
+        local_path = safe_img_path(img)
         try:
             chain = [
                 Plain(text),
                 (
-                    Image.fromFileSystem(path)
-                    if os.path.exists(path)
-                    else Image.fromURL(self.image_base_url + img)
+                    Image.fromFileSystem(local_path)
+                    if local_path and os.path.exists(local_path)
+                    else (Image.fromURL(base_url + url_img) if base_url and url_img else None)
                 ),
             ]
+            chain = [x for x in chain if x is not None]
             yield event.chain_result(chain)
         except Exception:
             yield event.plain_result(text)
@@ -864,8 +981,8 @@ class WifePlugin(Star):
         async with get_config_lock(gid):
             cfg = load_group_config(gid)
             if slot is None:
-                target_data = cfg.get(tid)
-                if not target_data or not isinstance(target_data, list) or target_data[1] != today:
+                target_img, _ = extract_today_wife(cfg.get(tid), today)
+                if not target_img:
                     yield event.plain_result("对方今天还没有老婆可牛哦~")
                     return
             else:
@@ -907,12 +1024,12 @@ class WifePlugin(Star):
         async with get_config_lock(gid):
             cfg = load_group_config(gid)
             if slot is None:
-                target_data = cfg.get(tid)
-                if not target_data or not isinstance(target_data, list) or target_data[1] != today:
+                target_img, owner = extract_today_wife(cfg.get(tid), today)
+                if not target_img:
                     stolen_img = None
                 else:
-                    stolen_img = target_data[0]
-                    stolen_from = target_data[2] if len(target_data) > 2 else str(tid)
+                    stolen_img = target_img
+                    stolen_from = owner or str(tid)
 
                     # 目标用户失去今日老婆（保持“牛”语义）
                     del cfg[tid]
@@ -980,16 +1097,19 @@ class WifePlugin(Star):
         else:
             text = f"{nick}，牛老婆成功！你牛到了 {name}{note_suffix}{src_suffix}，但你的背包已满，本次未保存~{keep_suffix}"
 
-        path = os.path.join(IMG_DIR, stolen_img)
+        base_url = (self.image_base_url or "").strip()
+        url_img = normalize_img_id(stolen_img)
+        local_path = safe_img_path(stolen_img)
         try:
             chain = [
                 Plain(text),
                 (
-                    Image.fromFileSystem(path)
-                    if os.path.exists(path)
-                    else Image.fromURL(self.image_base_url + stolen_img)
+                    Image.fromFileSystem(local_path)
+                    if local_path and os.path.exists(local_path)
+                    else (Image.fromURL(base_url + url_img) if base_url and url_img else None)
                 ),
             ]
+            chain = [x for x in chain if x is not None]
             yield event.chain_result(chain)
         except Exception:
             yield event.plain_result(text)
@@ -1036,7 +1156,7 @@ class WifePlugin(Star):
         # 检查是否有老婆并删除
         async with get_config_lock(gid):
             cfg = load_group_config(gid)
-            if uid not in cfg or cfg[uid][1] != today:
+            if not extract_today_wife(cfg.get(uid), today)[0]:
                 yield event.plain_result(f"{nick}，你今天还没有老婆，先去抽一个再来换吧~")
                 return
             
@@ -1179,19 +1299,7 @@ class WifePlugin(Star):
         tid = self.parse_at_target(event)
         nick = event.get_sender_name()
         today = get_today()
-        
-        async with records_lock:
-            # 检查每日交换请求次数
-            grp_limit = records["swap"].setdefault(gid, {})
-            rec_lim = grp_limit.get(uid, {"date": "", "count": 0})
-            
-            if rec_lim["date"] != today:
-                rec_lim = {"date": today, "count": 0}
-            
-            if rec_lim["count"] >= self.swap_max_per_day:
-                yield event.plain_result(f"{nick}，你今天已经发起了{self.swap_max_per_day}次交换请求啦，明天再来吧~")
-                return
-        
+
         if not tid or tid == uid:
             yield event.plain_result(f"{nick}，请在命令后@你想交换的对象哦~")
             return
@@ -1200,21 +1308,54 @@ class WifePlugin(Star):
         async with get_config_lock(gid):
             cfg = load_group_config(gid)
             for x in (uid, tid):
-                if x not in cfg or cfg[x][1] != today:
+                if not extract_today_wife(cfg.get(x), today)[0]:
                     who = nick if x == uid else "对方"
                     yield event.plain_result(f"{who}，今天还没有老婆，无法进行交换哦~")
                     return
-        
-        # 记录交换请求
+
+        # 防止重复请求（先检查是否已存在）
+        async with swap_lock:
+            grp = swap_requests.setdefault(gid, {})
+            existing = grp.get(uid)
+            if isinstance(existing, dict) and existing.get("date") == today:
+                yield event.plain_result(f"{nick}，你今天已经发起过交换请求了，用“查看交换请求”看看吧~")
+                return
+
+        # 记录交换请求次数（原子 check+increment）
         async with records_lock:
-            rec_lim["count"] += 1
+            grp_limit = records["swap"].setdefault(gid, {})
+            rec_lim = grp_limit.get(uid, {"date": "", "count": 0})
+            if rec_lim.get("date") != today:
+                rec_lim = {"date": today, "count": 0}
+            if rec_lim.get("count", 0) >= self.swap_max_per_day:
+                yield event.plain_result(f"{nick}，你今天已经发起了{self.swap_max_per_day}次交换请求啦，明天再来吧~")
+                return
+            rec_lim["count"] = int(rec_lim.get("count", 0)) + 1
             grp_limit[uid] = rec_lim
             save_records()
         
+        need_rollback = False
         async with swap_lock:
             grp = swap_requests.setdefault(gid, {})
-            grp[uid] = {"target": tid, "date": today}
-            save_swap_requests()
+            existing2 = grp.get(uid)
+            if isinstance(existing2, dict) and existing2.get("date") == today:
+                # 并发重复：不覆盖现有请求
+                need_rollback = True
+            else:
+                grp[uid] = {"target": tid, "date": today}
+                save_swap_requests()
+
+        if need_rollback:
+            # 回滚次数占用
+            async with records_lock:
+                grp_limit = records["swap"].setdefault(gid, {})
+                rec_lim = grp_limit.get(uid, {"date": today, "count": 0})
+                if rec_lim.get("date") == today and rec_lim.get("count", 0) > 0:
+                    rec_lim["count"] = max(0, int(rec_lim.get("count", 0)) - 1)
+                    grp_limit[uid] = rec_lim
+                    save_records()
+            yield event.plain_result(f"{nick}，你今天已经发起过交换请求了，用“查看交换请求”看看吧~")
+            return
         
         yield event.chain_result([
             Plain(f"{nick} 想和 "), At(qq=int(tid)),
@@ -1227,6 +1368,11 @@ class WifePlugin(Star):
         tid = str(event.get_sender_id())
         uid = self.parse_at_target(event)
         nick = event.get_sender_name()
+        today = get_today()
+
+        if not uid:
+            yield event.plain_result(f"{nick}，请在命令后@发起者，或用\"查看交换请求\"命令查看当前请求哦~")
+            return
         
         # 检查和删除交换请求（原子操作）
         async with swap_lock:
@@ -1239,15 +1385,34 @@ class WifePlugin(Star):
             
             # 删除请求
             del grp[uid]
+            save_swap_requests()
         
         # 执行交换
+        swapped = False
         async with get_config_lock(gid):
             cfg = load_group_config(gid)
-            cfg[uid][0], cfg[tid][0] = cfg[tid][0], cfg[uid][0]
-            save_group_config(gid, cfg)
-        
-        # 保存交换请求删除
-        save_swap_requests()
+            u_img, _ = extract_today_wife(cfg.get(uid), today)
+            t_img, _ = extract_today_wife(cfg.get(tid), today)
+            if not u_img or not t_img:
+                swapped = False
+            else:
+                # 仅交换 img 字段，保留各自昵称与日期
+                cfg[uid][0] = t_img
+                cfg[tid][0] = u_img
+                save_group_config(gid, cfg)
+                swapped = True
+
+        if not swapped:
+            # 交换失败：返还发起者次数（请求已删除）
+            async with records_lock:
+                grp_limit = records["swap"].setdefault(gid, {})
+                rec_lim = grp_limit.get(uid, {"date": today, "count": 0})
+                if rec_lim.get("date") == today and rec_lim.get("count", 0) > 0:
+                    rec_lim["count"] = max(0, int(rec_lim.get("count", 0)) - 1)
+                    grp_limit[uid] = rec_lim
+                    save_records()
+            yield event.plain_result("交换失败：你们其中一方的今日老婆已变更/消失，本次请求已取消并返还次数~")
+            return
         
         # 取消相关交换请求
         cancel_msg = await self.cancel_swap_on_wife_change(gid, [uid, tid])
@@ -1282,13 +1447,15 @@ class WifePlugin(Star):
         """查看当前交换请求"""
         gid = str(event.message_obj.group_id)
         me = str(event.get_sender_id())
-        
-        grp = swap_requests.get(gid, {})
+
+        async with swap_lock:
+            grp = dict(swap_requests.get(gid, {}) or {})
         cfg = load_group_config(gid)
         
         # 获取发起的和收到的请求
-        sent_targets = [rec["target"] for uid, rec in grp.items() if uid == me]
-        received_from = [uid for uid, rec in grp.items() if rec.get("target") == me]
+        sent_targets = [rec.get("target") for uid, rec in grp.items() if uid == me and isinstance(rec, dict)]
+        sent_targets = [x for x in sent_targets if x]
+        received_from = [uid for uid, rec in grp.items() if isinstance(rec, dict) and rec.get("target") == me]
         
         if not sent_targets and not received_from:
             yield event.plain_result("你当前没有任何交换请求哦~")
@@ -1296,11 +1463,11 @@ class WifePlugin(Star):
         
         parts = []
         for tid in sent_targets:
-            name = cfg.get(tid, [None, None, "未知用户"])[2]
+            name = get_cfg_nick(cfg, str(tid), "未知用户")
             parts.append(f"→ 你发起给 {name} 的交换请求")
         
         for uid in received_from:
-            name = cfg.get(uid, [None, None, "未知用户"])[2]
+            name = get_cfg_nick(cfg, str(uid), "未知用户")
             parts.append(f"→ {name} 发起给你的交换请求")
         
         text = "当前交换请求如下：\n" + "\n".join(parts) + "\n请在\"同意交换\"或\"拒绝交换\"命令后@发起者进行操作~"
@@ -1311,29 +1478,36 @@ class WifePlugin(Star):
     async def cancel_swap_on_wife_change(self, gid: str, user_ids: list) -> str | None:
         """检查并取消与指定用户相关的交换请求"""
         today = get_today()
-        grp = swap_requests.get(gid, {})
-        grp_limit = records["swap"].setdefault(gid, {})
-        
-        # 找出需要取消的交换请求
-        to_cancel = [
-            req_uid for req_uid, req in grp.items()
-            if req_uid in user_ids or req.get("target") in user_ids
-        ]
-        
+        to_cancel: list[str] = []
+
+        # 先在 swap_lock 下原子删除请求并落盘，避免并发丢写
+        async with swap_lock:
+            grp = swap_requests.get(gid, {})
+            if not isinstance(grp, dict):
+                return None
+            for req_uid, req in list(grp.items()):
+                if req_uid in user_ids or (isinstance(req, dict) and req.get("target") in user_ids):
+                    to_cancel.append(req_uid)
+                    try:
+                        del grp[req_uid]
+                    except KeyError:
+                        pass
+            if to_cancel:
+                save_swap_requests()
+
         if not to_cancel:
             return None
-        
-        # 取消请求并返还次数
-        for req_uid in to_cancel:
-            rec_lim = grp_limit.get(req_uid, {"date": "", "count": 0})
-            if rec_lim.get("date") == today and rec_lim.get("count", 0) > 0:
-                rec_lim["count"] = max(0, rec_lim["count"] - 1)
-                grp_limit[req_uid] = rec_lim
-            del grp[req_uid]
-        
-        save_swap_requests()
-        save_records()
-        
+
+        # 返还次数（records_lock）
+        async with records_lock:
+            grp_limit = records["swap"].setdefault(gid, {})
+            for req_uid in to_cancel:
+                rec_lim = grp_limit.get(req_uid, {"date": "", "count": 0})
+                if rec_lim.get("date") == today and rec_lim.get("count", 0) > 0:
+                    rec_lim["count"] = max(0, int(rec_lim.get("count", 0)) - 1)
+                    grp_limit[req_uid] = rec_lim
+            save_records()
+
         return f"已自动取消 {len(to_cancel)} 条相关的交换请求并返还次数~"
 
     async def terminate(self):
