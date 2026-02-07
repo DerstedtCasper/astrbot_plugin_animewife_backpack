@@ -251,6 +251,26 @@ def get_today_slot_marks(cfg: dict) -> dict:
     marks = cfg.get(BACKPACK_TODAY_SLOT_KEY, {})
     return marks if isinstance(marks, dict) else {}
 
+def _coerce_int(value: object) -> int | None:
+    """Best-effort int coercion for persisted JSON fields (e.g. slot stored as \"3\")."""
+    # bool is a subclass of int, but treating True/False as slot numbers is undesirable.
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        return None
+    if isinstance(value, str):
+        s = value.strip()
+        if s.isdigit():
+            try:
+                return int(s)
+            except Exception:
+                return None
+    return None
+
 
 def _read_today_slot_mark(marks: dict, uid: str, today: str, size: int) -> int | None:
     rec = marks.get(uid)
@@ -258,8 +278,8 @@ def _read_today_slot_mark(marks: dict, uid: str, today: str, size: int) -> int |
         return None
     if rec.get("date") != today:
         return None
-    slot = rec.get("slot")
-    if not isinstance(slot, int):
+    slot = _coerce_int(rec.get("slot"))
+    if slot is None:
         return None
     if 1 <= slot <= size:
         return slot
@@ -355,8 +375,9 @@ def normalize_today_record(raw: object, today: str, *, nick_default: str | None 
             out["nick"] = nick_default
         if isinstance(raw.get("img"), str) and raw.get("img"):
             out["img"] = raw.get("img")
-        if isinstance(raw.get("slot"), int):
-            out["slot"] = raw.get("slot")
+        slot = _coerce_int(raw.get("slot"))
+        if slot is not None:
+            out["slot"] = slot
         if isinstance(raw.get("note"), str) and raw.get("note"):
             out["note"] = raw.get("note")
         return out
@@ -698,10 +719,10 @@ load_ntr_statuses()
 
 @register(
     "astrbot_plugin_animewife",
-    "SomniumDerstedt",
+    "DerstedtCasper",
     "群二次元老婆插件（自用改版）",
     "1.9.1",
-    "https://github.com/SomniumDerstedt/astrbot_plugin_animewife",
+    "https://github.com/DerstedtCasper/astrbot_plugin_animewife_backpack",
 )
 class WifePlugin(Star):
     """二次元老婆插件主类"""
