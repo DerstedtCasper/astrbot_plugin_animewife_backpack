@@ -53,6 +53,30 @@
         "default": 7,
         "hint": "每个用户可保存的老婆槽位数量；未满时抽老婆会自动入库，满了需用 /替换老婆 手动替换"
     },
+    "include_group_members": {
+        "description": "抽取池加入群成员头像",
+        "type": "bool",
+        "default": false,
+        "hint": "启用后，/抽老婆 与 /换老婆 有概率抽到当前群成员（使用其 QQ 头像）"
+    },
+    "group_member_draw_probability": {
+        "description": "抽到群成员概率",
+        "type": "float",
+        "default": 0.15,
+        "hint": "在启用“加入群成员头像”后，抽取到群成员头像的概率，取值范围 [0, 1]"
+    },
+    "group_member_pool_max": {
+        "description": "群成员抽取池最大人数",
+        "type": "int",
+        "default": 200,
+        "hint": "群成员过多时仅随机抽样最多 N 人进入抽取池，避免超大群性能问题"
+    },
+    "group_member_pool_ttl_sec": {
+        "description": "群成员列表缓存时间(秒)",
+        "type": "int",
+        "default": 600,
+        "hint": "群成员名单与头像 URL 的缓存时间，减少频繁请求平台接口"
+    },
     "image_base_url": {
         "description": "图片服务器基础 URL",
         "type": "string",

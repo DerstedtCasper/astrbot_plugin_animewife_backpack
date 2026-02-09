@@ -16,9 +16,12 @@ from pathlib import Path
 import random
 import os
 import json
+import difflib
+import re
 import aiohttp
 import asyncio
 import tempfile
+import urllib.parse
 
 # ==================== 常量定义 ====================
 
@@ -43,6 +46,12 @@ ALLOWED_IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
 # 网络请求超时（避免外部 HTTP 卡住协程）
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
+
+# 群成员“老婆”伪 ID 前缀：用于把群成员头像注入抽取池（不参与本地文件读取）
+MEMBER_ID_PREFIX = "__member__:"
+
+# QQ 头像 URL（aiocqhttp/OneBot 常用）
+QQ_AVATAR_URL = "https://q1.qlogo.cn/g?b=qq&nk={uid}&s=640"
 
 # ==================== 全局数据存储 ====================
 
@@ -644,11 +653,111 @@ def normalize_cmd_text(text: str) -> str:
 
 def format_wife_name(img: str) -> str:
     """将图片文件名转换为展示名。"""
+    if isinstance(img, str) and img.startswith(MEMBER_ID_PREFIX):
+        parsed = parse_member_id(img)
+        if parsed:
+            uid, name = parsed
+            if name:
+                return f"群成员{name}"
+            return f"群成员({uid})"
     name = os.path.splitext(img)[0].split("/")[-1]
     if "!" in name:
         source, chara = name.split("!", 1)
         return f"《{source}》的{chara}"
     return name
+
+
+def make_member_id(uid: str, name: str | None = None) -> str:
+    uid = str(uid)
+    if name:
+        safe_name = urllib.parse.quote(str(name), safe="")
+        return f"{MEMBER_ID_PREFIX}{uid}:{safe_name}"
+    return f"{MEMBER_ID_PREFIX}{uid}"
+
+
+def parse_member_id(img: str) -> tuple[str, str | None] | None:
+    if not isinstance(img, str) or not img.startswith(MEMBER_ID_PREFIX):
+        return None
+    rest = img[len(MEMBER_ID_PREFIX):]
+    if not rest:
+        return None
+    parts = rest.split(":", 1)
+    uid = parts[0].strip()
+    if not uid:
+        return None
+    name = None
+    if len(parts) > 1 and parts[1]:
+        try:
+            name = urllib.parse.unquote(parts[1])
+        except Exception:
+            name = parts[1]
+        name = (name or "").strip() or None
+    return uid, name
+
+
+def _norm_search_key(s: str) -> str:
+    # 去掉空白与常见标点，提升中文关键词的模糊匹配效果
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(
+        r"[`~!@#$%^&*()_\-+=\[\]{}\\|;:'\",.<>/?·，。．、：；！“”‘’（）【】《》「」『』]",
+        "",
+        s,
+    )
+    return s
+
+
+def rank_wife_candidates(imgs: list[str], keyword: str, *, limit: int = 8) -> list[str]:
+    """
+    关键词匹配：先做包含匹配，再做模糊匹配；返回按相似度排序的候选列表（最多 limit 个）。
+    用于 /发老婆，避免打错字与同名歧义。
+    """
+    key = _norm_search_key(keyword)
+    if not key:
+        return []
+
+    scored: list[tuple[float, str, str]] = []
+    for img in imgs:
+        if not isinstance(img, str) or not img:
+            continue
+        # /发老婆 只对“图片老婆”生效；群成员头像不加入候选
+        if img.startswith(MEMBER_ID_PREFIX):
+            continue
+
+        disp = format_wife_name(img)
+        n_img = _norm_search_key(img)
+        n_disp = _norm_search_key(disp)
+
+        # 拆解（source/chara），提升同名/错别字匹配效果
+        base = os.path.splitext(img)[0].split("/")[-1]
+        source = None
+        chara = base
+        if "!" in base:
+            source, chara = base.split("!", 1)
+        n_source = _norm_search_key(source or "")
+        n_chara = _norm_search_key(chara or "")
+        n_mix = (n_source + n_chara) if (n_source or n_chara) else ""
+
+        score = 0.0
+        if key and (key in n_img or key in n_disp or (n_chara and key in n_chara) or (n_mix and key in n_mix)):
+            # 包含匹配优先
+            score = 2.0
+        else:
+            # 模糊匹配兜底
+            r = 0.0
+            for cand in (n_chara, n_mix, n_disp, n_img, n_source):
+                if not cand:
+                    continue
+                r = max(r, difflib.SequenceMatcher(None, key, cand).ratio())
+            score = r
+            if score < 0.42:
+                continue
+
+        # 二级排序：更短的展示名更可能是“精确目标”
+        scored.append((score, img, disp))
+
+    scored.sort(key=lambda x: (x[0], -len(x[2])), reverse=True)
+    return [img for _, img, _ in scored[: max(1, int(limit))]]
 
 
 def load_ntr_statuses():
@@ -721,7 +830,7 @@ load_ntr_statuses()
     "astrbot_plugin_animewife",
     "DerstedtCasper",
     "群二次元老婆插件（自用改版）",
-    "1.9.2",
+    "1.9.3",
     "https://github.com/DerstedtCasper/astrbot_plugin_animewife_backpack",
 )
 class WifePlugin(Star):
@@ -730,6 +839,8 @@ class WifePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        self._member_cache: dict[str, tuple[float, list[str]]] = {}
+        self._member_cache_lock = asyncio.Lock()
         self._init_config()
         self._init_commands()
         self.admins = self.load_admins()
@@ -750,6 +861,22 @@ class WifePlugin(Star):
             self.backpack_size = max(1, int(self.config.get("backpack_size") or 7))
         except Exception:
             self.backpack_size = 7
+
+        # 群成员头像注入抽取池（仅影响 /抽老婆 与 /换老婆 的随机抽取）
+        self.include_group_members = bool(self.config.get("include_group_members") or False)
+        try:
+            prob = float(self.config.get("group_member_draw_probability") or 0.15)
+        except Exception:
+            prob = 0.15
+        self.group_member_draw_probability = max(0.0, min(1.0, prob))
+        try:
+            self.group_member_pool_max = max(0, int(self.config.get("group_member_pool_max") or 200))
+        except Exception:
+            self.group_member_pool_max = 200
+        try:
+            self.group_member_pool_ttl_sec = max(30, int(self.config.get("group_member_pool_ttl_sec") or 600))
+        except Exception:
+            self.group_member_pool_ttl_sec = 600
 
     def _init_commands(self):
         """初始化命令映射表"""
@@ -874,7 +1001,7 @@ class WifePlugin(Star):
 
         fetched_img: str | None = None
         if not img:
-            fetched_img = await self._fetch_wife_image()
+            fetched_img = await self._fetch_wife_image_for_event(event)
             if not fetched_img:
                 yield event.plain_result("抱歉，今天的老婆获取失败了，请稍后再试~")
                 return
@@ -925,8 +1052,69 @@ class WifePlugin(Star):
 
     async def _fetch_wife_image(self) -> str | None:
         """获取老婆图片"""
+        # Deprecated: keep for backward compatibility (should not be called after v1.9.3 changes)
         imgs = await self._list_wife_images()
         return random.choice(imgs) if imgs else None
+
+    async def _fetch_wife_image_for_event(self, event: AstrMessageEvent, *, allow_members: bool = True) -> str | None:
+        """按事件上下文抽取“老婆实体”：图片老婆或群成员头像老婆。"""
+        if allow_members and self.include_group_members and self.group_member_draw_probability > 0:
+            try:
+                if random.random() < self.group_member_draw_probability:
+                    gid = str(event.message_obj.group_id)
+                    member_ids = await self._list_group_member_ids(event, gid)
+                    if member_ids:
+                        return random.choice(member_ids)
+            except Exception:
+                pass
+
+        imgs = await self._list_wife_images()
+        return random.choice(imgs) if imgs else None
+
+    async def _list_group_member_ids(self, event: AstrMessageEvent, gid: str) -> list[str]:
+        """获取群成员列表并转换为“群成员老婆”ID；带 TTL 缓存，避免频繁请求平台。"""
+        gid = str(gid)
+        now = asyncio.get_running_loop().time()
+
+        async with self._member_cache_lock:
+            cached = self._member_cache.get(gid)
+            if cached:
+                ts, ids = cached
+                if (now - ts) <= float(self.group_member_pool_ttl_sec) and ids:
+                    return list(ids)
+
+        bot = getattr(event, "bot", None)
+        if not bot or not hasattr(bot, "get_group_member_list"):
+            async with self._member_cache_lock:
+                self._member_cache[gid] = (now, [])
+            return []
+
+        try:
+            members = await bot.get_group_member_list(group_id=int(gid))
+        except Exception:
+            async with self._member_cache_lock:
+                self._member_cache[gid] = (now, [])
+            return []
+
+        ids: list[str] = []
+        if isinstance(members, list):
+            for m in members:
+                if not isinstance(m, dict):
+                    continue
+                uid = m.get("user_id")
+                if uid is None:
+                    continue
+                name = m.get("card") or m.get("nickname") or str(uid)
+                ids.append(make_member_id(str(uid), str(name)))
+
+        # 控制最大池大小，避免超大群导致抽取池过重
+        max_n = int(self.group_member_pool_max or 0)
+        if max_n > 0 and len(ids) > max_n:
+            ids = random.sample(ids, k=max_n)
+
+        async with self._member_cache_lock:
+            self._member_cache[gid] = (now, list(ids))
+        return ids
 
     async def _list_wife_images(self) -> list[str]:
         """获取老婆图片文件名列表（本地优先，其次网络）。"""
@@ -977,7 +1165,11 @@ class WifePlugin(Star):
         local_path = safe_img_path(img)
         try:
             chain: list = [Plain(text)]
-            if local_path and os.path.exists(local_path):
+            member = parse_member_id(img)
+            if member:
+                uid, _ = member
+                chain.append(Image.fromURL(QQ_AVATAR_URL.format(uid=uid)))
+            elif local_path and os.path.exists(local_path):
                 chain.append(Image.fromFileSystem(local_path))
             elif base_url and url_img:
                 chain.append(Image.fromURL(base_url + url_img))
@@ -1110,15 +1302,19 @@ class WifePlugin(Star):
         url_img = normalize_img_id(img)
         local_path = safe_img_path(img)
         try:
-            chain = [
-                Plain(text),
-                (
-                    Image.fromFileSystem(local_path)
-                    if local_path and os.path.exists(local_path)
-                    else (Image.fromURL(base_url + url_img) if base_url and url_img else None)
-                ),
-            ]
-            chain = [x for x in chain if x is not None]
+            comp = None
+            member = parse_member_id(img)
+            if member:
+                uid2, _ = member
+                comp = Image.fromURL(QQ_AVATAR_URL.format(uid=uid2))
+            elif local_path and os.path.exists(local_path):
+                comp = Image.fromFileSystem(local_path)
+            elif base_url and url_img:
+                comp = Image.fromURL(base_url + url_img)
+
+            chain = [Plain(text)]
+            if comp is not None:
+                chain.append(comp)
             yield event.chain_result(chain)
         except Exception:
             yield event.plain_result(text)
@@ -1276,18 +1472,40 @@ class WifePlugin(Star):
             yield event.plain_result(f"{sender_nick}，请在命令后提供关键词。例如：/发老婆 @用户 澪")
             return
 
+        # 支持“候选序号”与模糊匹配：/发老婆 @用户 <关键词> [候选序号]
+        pick: int | None = None
+        parts = keyword.split()
+        if len(parts) >= 2 and parts[-1].isdigit():
+            try:
+                pick = int(parts[-1])
+                keyword = " ".join(parts[:-1]).strip()
+            except Exception:
+                pick = None
+
         all_imgs = await self._list_wife_images()
-        kw = keyword.lower()
-        matches = [
-            img
-            for img in all_imgs
-            if kw in img.lower() or kw in format_wife_name(img).lower()
-        ]
-        if not matches:
-            yield event.plain_result(f"{sender_nick}，没有找到包含“{keyword}”的老婆图片。")
+        candidates = rank_wife_candidates(all_imgs, keyword, limit=8)
+        if not candidates:
+            yield event.plain_result(f"{sender_nick}，没有找到与“{keyword}”相近的老婆图片。")
             return
 
-        img = random.choice(matches)
+        if len(candidates) > 1 and not pick:
+            lines = []
+            for i, cand in enumerate(candidates, start=1):
+                lines.append(f"{i}. {format_wife_name(cand)}（{cand}）")
+            text = (
+                f"{sender_nick}，找到多个候选，请用 /发老婆 @用户 {keyword} <序号> 指定：\n"
+                + "\n".join(lines)
+            )
+            yield event.plain_result(text)
+            return
+
+        if pick is not None:
+            if pick < 1 or pick > len(candidates):
+                yield event.plain_result(f"{sender_nick}，候选序号超出范围：1-{len(candidates)}。")
+                return
+            img = candidates[pick - 1]
+        else:
+            img = candidates[0]
 
         target_name = None
         try:
@@ -1345,15 +1563,19 @@ class WifePlugin(Star):
         url_img = normalize_img_id(img)
         local_path = safe_img_path(img)
         try:
-            chain = [
-                Plain(text),
-                (
-                    Image.fromFileSystem(local_path)
-                    if local_path and os.path.exists(local_path)
-                    else (Image.fromURL(base_url + url_img) if base_url and url_img else None)
-                ),
-            ]
-            chain = [x for x in chain if x is not None]
+            comp = None
+            member = parse_member_id(img)
+            if member:
+                uid2, _ = member
+                comp = Image.fromURL(QQ_AVATAR_URL.format(uid=uid2))
+            elif local_path and os.path.exists(local_path):
+                comp = Image.fromFileSystem(local_path)
+            elif base_url and url_img:
+                comp = Image.fromURL(base_url + url_img)
+
+            chain = [Plain(text)]
+            if comp is not None:
+                chain.append(comp)
             yield event.chain_result(chain)
         except Exception:
             yield event.plain_result(text)
@@ -1573,15 +1795,19 @@ class WifePlugin(Star):
         url_img = normalize_img_id(stolen_img)
         local_path = safe_img_path(stolen_img)
         try:
-            chain = [
-                Plain(text),
-                (
-                    Image.fromFileSystem(local_path)
-                    if local_path and os.path.exists(local_path)
-                    else (Image.fromURL(base_url + url_img) if base_url and url_img else None)
-                ),
-            ]
-            chain = [x for x in chain if x is not None]
+            comp = None
+            member = parse_member_id(stolen_img)
+            if member:
+                uid2, _ = member
+                comp = Image.fromURL(QQ_AVATAR_URL.format(uid=uid2))
+            elif local_path and os.path.exists(local_path):
+                comp = Image.fromFileSystem(local_path)
+            elif base_url and url_img:
+                comp = Image.fromURL(base_url + url_img)
+
+            chain = [Plain(text)]
+            if comp is not None:
+                chain.append(comp)
             yield event.chain_result(chain)
         except Exception:
             yield event.plain_result(text)
@@ -1657,7 +1883,7 @@ class WifePlugin(Star):
             yield event.plain_result(f"{nick}，你今天还没有老婆，先去抽一个再来换吧~")
             return
 
-        new_img = await self._fetch_wife_image()
+        new_img = await self._fetch_wife_image_for_event(event)
         if not new_img:
             # 回滚占用次数
             async with records_lock:
